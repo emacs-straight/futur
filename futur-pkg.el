@@ -1,2 +1,2 @@
-;; Generated package description from futur.el  -*- no-byte-compile: t -*-
-(define-package "futur" "1.0.0.20260212.164033" "Future/promise-based async library" 'nil :commit "b45f7f64487b7c6786cc2a1997bab9237a75020f" :url "https://elpa.gnu.org/packages/futur.html" :authors '(("Stefan Monnier" . "monnier@iro.umontreal.ca")) :maintainer '("Stefan Monnier" . "monnier@iro.umontreal.ca") :keywords '("concurrency" "async" "promises" "futures"))
+;; Generated package description from futur.el  -*- no-byte-compile: t; lexical-binding:t -*-
+(define-package "futur" "1.0.0.20260213.162531" "Future/promise-based async library" 'nil :commit "44112d22595f1bc3df580236ecb92f7c649d4132" :url "https://elpa.gnu.org/packages/futur.html" :authors '(("Stefan Monnier" . "monnier@iro.umontreal.ca")) :maintainer '("Stefan Monnier" . "monnier@iro.umontreal.ca") :keywords '("concurrency" "async" "promises" "futures"))

@@ -1,3 +1,9 @@
+Since 1.0:
+
+- Fix compatibility with Emacs<31.
+- Minor bug fixes.
+
 Version 1.0:
+
 - After years of sitting in the dark, it's finally getting dusted up for
   a release.

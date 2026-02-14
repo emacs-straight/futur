@@ -123,7 +123,13 @@
 
 ;;; News:
 
+;; Since 1.0:
+
+;; - Fix compatibility with Emacs<31.
+;; - Minor bug fixes.
+
 ;; Version 1.0:
+
 ;; - After years of sitting in the dark, it's finally getting dusted up for
 ;;   a release.
 
@@ -161,20 +167,30 @@
         (with-demoted-errors "future--background: %S"
           (apply pending))))))
 
+(defun futur--make-thread (f name)
+  (condition-case nil
+      (make-thread f name 'silently)
+    (wrong-number-of-arguments ;; Emacs<31
+     (with-current-buffer (get-buffer-create " *futur--background*")
+       (make-thread f name)))))
+
 (defconst futur--background
-  (make-thread #'futur--background "futur--background" 'silently))
+  (when (fboundp 'make-thread)          ;New in Emacs-25
+    (futur--make-thread #'futur--background "futur--background")))
 
 (defun futur--funcall (&rest args)
   "Call ARGS like `funcall' but outside of the current dynamic scope.
 The code is conceptually run in another thread and while we try to run as
 soon as possible, and fairly, we do not guarantee the specific
 time or order of execution."
-  (with-mutex futur--pending-mutex
-    (push args futur--pending-r)
-    ;; FIXME: Maybe we should have combination
-    ;; `mutex-unlock+condition-notify', i.e. a variant of
-    ;; `condition-notify' which doesn't regrab the lock?
-    (condition-notify futur--pending-condition)))
+  (if (not (fboundp 'make-thread))      ;Emacs<26
+      (apply #'run-with-timer 0 nil args)
+    (with-mutex futur--pending-mutex
+      (push args futur--pending-r)
+      ;; FIXME: Maybe we should have combination
+      ;; `mutex-unlock+condition-notify', i.e. a variant of
+      ;; `condition-notify' which doesn't regrab the lock?
+      (condition-notify futur--pending-condition))))
 
 (defvar futur--idle-loop-bug80286
   ;; "Idle loop" thread to try and make sure we run timers, filters, etc...
@@ -188,7 +204,7 @@ time or order of execution."
   ;;         at emacs.c:445
   ;;
   ;;(when (fboundp 'make-thread)
-  ;;  (make-thread
+  ;;  (futur--make-thread
   ;;   (lambda ()
   ;;     (while t (accept-process-output nil (* 60 60 24))))
   ;;   "futur-idle-loop"))
@@ -252,6 +268,9 @@ A futur has 3 possible states:
     ((futur--waiting _ clients)
      (setf (futur--clients futur) (if err 'error t))
      (setf (futur--value futur) (or err val))
+     ;; FIXME: Should we just always abort the blocker instead of
+     ;; doing it only from `futur-abort'?
+     ;;(futur-blocker-abort blocker)
      ;; CLIENTS is usually in reverse order since we always `push' to them.
      (dolist (client (nreverse clients))
        ;; Don't run the clients directly from here, so we don't nest,
@@ -344,8 +363,12 @@ By default any error in FUTUR is propagated to the returned future."
        (setf (futur--clients futur)
              (cons
               (lambda (err val)
-                (if err (futur-deliver-failure new err)
-                  (futur--run-continuation new fun (list val))))
+                ;; If NEW is not waiting any more (e.g. it's been aborted),
+                ;; don't bother running the continuation.
+                (pcase new
+                  ((futur--waiting)
+                   (if err (futur-deliver-failure new err)
+                    (futur--run-continuation new fun (list val))))))
               clients))
        new))
     ((and (futur--error _) (guard (null error-fun))) futur)
@@ -430,11 +453,12 @@ ERROR-FUN is called with a single argument, the error object."
         (pcase-exhaustive bindings
           ('() (macroexp-progn body))
           (`((,var ,exp) . ,bindings)
-           ;; FIXME: Catch errors in EXP to run `error-fun'?
+           ;; FIXME: Catch errors in EXP, to run `error-fun'?
            `(pcase-let ((,var ,exp)) ,(loop bindings)))
           (`((,var <- ,exp) . ,bindings)
+           ;; FIXME: Catch errors in EXP, to run `error-fun'?
            `(futur-bind ,exp
-                        (lambda (,var) ,(loop bindings))
+                        (pcase-lambda (,var) ,(loop bindings))
                         ,error-fun)))))))
 
 (oclosure-define futur--aux
@@ -570,9 +594,48 @@ If IDLE is non-nil, then wait for that amount of idle time."
     t))
 
 (cl-defmethod futur-blocker-abort ((timer (head timer)) _error)
-  (cancel-timer (cdr timer)))
+  ;; Older versions of Emacs signal errors if we try to cancel a timer
+  ;; that's already run (or been canceled).
+  (unless (timer--triggered timer) (cancel-timer (cdr timer))))
 
 ;;;; Processes
+
+(defcustom futur-process-max
+  (if (fboundp 'num-processors) (num-processors) 2)
+  "Maximum number of concurrent subprocesses."
+  :type 'integer)
+
+(defvar futur--process-active nil
+  "List of active process-futures.")
+
+(defvar futur--process-waiting nil
+  "List of process-futures waiting to start.")
+
+(defun futur--process-bounded (&rest args)
+  (if (< (length futur--process-active) futur-process-max)
+      (let ((new (apply #'funcall args)))
+        (push new futur--process-active)
+        (futur-register-callback
+         new (oclosure-lambda (futur--aux) (_ _) (futur--process-next new)))
+        new)
+    (let ((new (futur--waiting 'waiting)))
+      (push (cons new args) futur--process-waiting)
+      new)))
+
+(defun futur--process-next (done)
+  (setq futur--process-active (delq done futur--process-active))
+  (cl-block nil
+   (while futur--process-waiting
+    (pcase-let ((`(,fut . ,call) (pop futur--process-waiting)))
+      (pcase fut
+        ((futur--waiting)
+         (let ((new (apply #'futur--process-bounded call)))
+          (futur-register-callback
+           new (lambda (err val) (futur--deliver new err val)))
+          (cl-return))))))))
+
+(cl-defmethod futur-blocker-abort ((_ (eql 'waiting)) _error)
+  nil)
 
 (defun futur--process-completed-p (proc)
   (memq (process-status proc) '(exit signal closed failed)))
@@ -581,7 +644,7 @@ If IDLE is non-nil, then wait for that amount of idle time."
   (when (futur--process-completed-p proc)
     (futur-deliver-value futur (process-exit-status proc))))
 
-(defun futur-process-make (&rest args)
+(defun futur--process-make (&rest args)
   "Create a process and return a future that delivers its exit code.
 The ARGS are like those of `make-process' except that they can't include
 `:sentinel' because that is used internally."
@@ -616,7 +679,7 @@ The DISPLAY argument is ignored: redisplay always happens."
     (`(:file ,(and file (pred stringp)))
      (setq destination (expand-file-name file)))
     (`(,_ . ,_) (error "Separate handling of stderr is not supported yet")))
-  (let* ((futur (futur-process-make
+  (let* ((futur (futur--process-make
                  :name program
                  :command (cons program args)
                  :coding (if (stringp destination) '(binary . nil))
@@ -625,6 +688,7 @@ The DISPLAY argument is ignored: redisplay always happens."
                  :filter (if (bufferp destination) nil
                            #'futur-process-call--filter)))
          (proc (pcase-exhaustive futur ((futur--waiting blocker) blocker))))
+    (push futur futur--process-active)
     (when (stringp destination)
       (write-region "" nil destination nil 'silent))
     (pcase-exhaustive infile
@@ -661,9 +725,9 @@ The DISPLAY argument is ignored: redisplay always happens."
   ;; FIXME: This is quite inefficient.  Our C code should instead provide
   ;; a non-blocking `(process-send-string PROC STRING CALLBACK)'.
   (futur-new
-   (lambda (f) (make-thread
+   (lambda (f) (futur--make-thread
            (lambda () (futur-deliver-value f (process-send-string proc string)))
-           "futur-process-send" 'silently))))
+           "futur-process-send"))))
 
 (cl-defmethod futur-blocker-wait ((th thread))
   (if (not (thread-live-p th))
@@ -675,7 +739,7 @@ The DISPLAY argument is ignored: redisplay always happens."
   ;; FIXME: This doesn't guarantee that the thread is aborted.
   ;; FIXME: Let's hope that the undocumented feature of `signal' applies
   ;; also to `thread-signal'.
-  (thread-signal th error nil))
+  (when (thread-live-p th) (thread-signal th error nil)))
 
 ;;;; Multi futures: Futures that are waiting for several other futures.
 
