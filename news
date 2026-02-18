@@ -1,5 +1,9 @@
 Since 1.0:
 
+- New functions: `futur-race', `futur-sit-for', `futur-url-retrieve'.
+- Rename `futur-error' to `futur-failed'.
+- Rename `futur-register-callback' to `futur--register-callback'.
+- Rename `futur-ize' to `futur--ize'.
 - Fix compatibility with Emacs<31.
 - Minor bug fixes.
 
