@@ -1,6 +1,7 @@
-Since 1.0:
+Version 1.1:
 
 - New functions: `futur-race', `futur-sit-for', `futur-url-retrieve'.
+- New function `futur-concurrency-bound' when you need to limit concurrency.
 - Rename `futur-error' to `futur-failed'.
 - Rename `futur-register-callback' to `futur--register-callback'.
 - Rename `futur-ize' to `futur--ize'.
