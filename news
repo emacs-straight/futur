@@ -1,5 +1,6 @@
 Since version 1.1:
 
+- New function `futur-p'.
 - Preliminary support to run ELisp code in subproceses.
 
 Version 1.1:
