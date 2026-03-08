@@ -1,8 +1,12 @@
 Since version 1.1:
 
-- `futur-bind' can now select which errors it catches.
+- `futur-abort' takes a second argument (the reason for the abortion).
+- New function `futur-funcll'.
+- `futur-bind' and `futur-blocking-wait-to-get-result' can now select
+  which errors they catch.
 - New function `futur-p'.
-- Preliminary support to run ELisp code in subproceses.
+- Preliminary support to run ELisp code in subproceses&sandboxes.
+- Experimental `futur-hacks-mode' using the preliminary sandbox code.
 
 Version 1.1:
 
