@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026  Free Software Foundation, Inc.
 
 ;; Author: Stefan Monnier <monnier@iro.umontreal.ca>
-;; Version: 1.1
+;; Version: 1.2
 ;; Keywords: concurrency, async, promises, futures
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -57,8 +57,6 @@
 ;;   successfully with VAL, and runs the clients waiting for that event.
 ;; - (futur-deliver-failure FUTUR ERROR): Mark FUTUR as having failed
 ;;   with ERROR, and runs the clients waiting for that event.
-;; - (futur--register-callback FUTUR FUN): Register FUN as a client.
-;;   Will be called with two arg (the ERROR and the VAL) when FUTURE completes.
 ;; - (futur-blocking-wait-to-get-result FUTUR): Busy-wait for FUTUR to complete
 ;;   and return its value.  Better use `futur-bind' or `futur-let*' instead.
 ;;   BEWARE: Please don't use it unless you really absolutely have to.
@@ -78,6 +76,31 @@
 ;;   resulting list of values.
 ;; - (futur-race &rest FUTURS): Run FUTURS concurrently, return the
 ;;   first result, and discard the rest.
+
+;;;; Predefined future constructors
+
+;; - (futur-funcall FUNC &rest ARGS)
+;;   Like `funcall', but runs the code asynchronously.
+;; - (futur-timeout TIME)
+;; - (futur-sit-for TIME)
+;; - (futur-process-call PROG &optional INFILE DESTINATION _DISPLAY &rest ARGS)
+;;   Like `call-process' but asynchronous, thus allows parallelism between
+;;   Emacs and the subprocess.
+;; - (futur-with-temp-buffer &rest BODY)
+;; - (futur-unwind-protect FORM &rest FORMS)
+;; - (futur-concurrency-bound FUNC &rest ARGS)
+;;   Like `futur-funcall' but throttles execution to avoid running too
+;;   many tasks concurrently.
+
+;;;; Experimental
+
+;; - (futur-hacks-mode &optional ARG)
+;;   Minor mode making various Emacs features use futures.
+;; - (futur--elisp-funcall FUNC &rest ARGS)
+;;   Like `futur-funcall' but runs the code in parallel in a subprocess.
+;; - (futur--sandbox-funcall FUNC &rest ARGS)
+;;   Like `futur--elisp-funcall' but runs the code in a sandbox so it
+;;   can be used with untrusted code.
 
 ;;;; Related packages
 
@@ -142,15 +165,16 @@
 
 ;;; News:
 
-;; Since version 1.1:
+;; Since version 1.2:
 
 ;; - `futur-abort' takes a second argument (the reason for the abortion).
-;; - New function `futur-funcll'.
+;; - New function `futur-funcall'.
 ;; - `futur-bind' and `futur-blocking-wait-to-get-result' can now select
 ;;   which errors they catch.
 ;; - New function `futur-p'.
 ;; - Preliminary support to run ELisp code in subproceses&sandboxes.
 ;; - Experimental `futur-hacks-mode' using the preliminary sandbox code.
+;; - New var `futur-use-threads' to be able to force the use of timers.
 
 ;; Version 1.1:
 
@@ -247,8 +271,17 @@ that it is not empty."
      (with-current-buffer (get-buffer-create " *futur--background*")
        (make-thread f name)))))
 
+(defvar futur-use-threads t
+  "If non-nil, futur will use timers for background tasks instead.
+Threads have the advantage that we can make sure background tasks are
+run in a clean dynamic environment, whereas timers are run in the dynamic
+environment of the current waiting code, which can include all kinds of
+undesirable let-bindings.
+But Emacs's threads still suffer from several implementation warts
+and limitations.")
+
 (defconst futur--background
-  (when (fboundp 'make-thread)          ;New in Emacs-25
+  (when (and futur-use-threads (fboundp 'make-thread)) ;New in Emacs-26
     (futur--make-thread #'futur--background "futur--background")))
 
 (defun futur--funcall (&rest args)
@@ -256,7 +289,7 @@ that it is not empty."
 The code is conceptually run in another thread and while we try to run as
 soon as possible, and fairly, we do not guarantee the specific
 time or order of execution."
-  (if (not (fboundp 'make-thread))      ;Emacs<26
+  (if (not futur--background)
       (apply #'run-with-timer 0 nil args)
     (with-mutex futur--pending-mutex
       (futur--queue-enqueue futur--pending args)
@@ -611,7 +644,7 @@ Returns a future that returns the same value as FORM.
 Execution of FORMS is guarantee to occur after completion of FORM,
 but it is not guaranteed to occur before completion of the returned future."
   (declare (indent 1) (debug t))
-  `(futur--unwind-protect ,form (lambda () ,@forms)))
+  `(futur--unwind-protect (futur-funcall (lambda () ,form)) (lambda () ,@forms)))
 
 ;;;; Futur blockers
 ;; Futur blockers are the objects over which a futur can be waiting, like
