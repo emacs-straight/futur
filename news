@@ -1,5 +1,9 @@
 Since version 1.2:
 
+- Syntax of `:error-fun' changed in `futur-let*'.
+
+Version 1.2:
+
 - `futur-abort' takes a second argument (the reason for the abortion).
 - New function `futur-funcall'.
 - `futur-bind' and `futur-blocking-wait-to-get-result' can now select

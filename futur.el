@@ -167,6 +167,10 @@
 
 ;; Since version 1.2:
 
+;; - Syntax of `:error-fun' changed in `futur-let*'.
+
+;; Version 1.2:
+
 ;; - `futur-abort' takes a second argument (the reason for the abortion).
 ;; - New function `futur-funcall'.
 ;; - `futur-bind' and `futur-blocking-wait-to-get-result' can now select
@@ -271,7 +275,7 @@ that it is not empty."
      (with-current-buffer (get-buffer-create " *futur--background*")
        (make-thread f name)))))
 
-(defvar futur-use-threads t
+(defvar futur-use-threads (fboundp 'make-thread) ;New in Emacs-26
   "If non-nil, futur will use timers for background tasks instead.
 Threads have the advantage that we can make sure background tasks are
 run in a clean dynamic environment, whereas timers are run in the dynamic
@@ -281,7 +285,7 @@ But Emacs's threads still suffer from several implementation warts
 and limitations.")
 
 (defconst futur--background
-  (when (and futur-use-threads (fboundp 'make-thread)) ;New in Emacs-26
+  (when futur-use-threads
     (futur--make-thread #'futur--background "futur--background")))
 
 (defun futur--funcall (&rest args)
@@ -310,7 +314,7 @@ time or order of execution."
   ;;         sig=sig@entry=6, backtrace_limit=backtrace_limit@entry=2147483647)
   ;;         at emacs.c:445
   ;;
-  ;;(when (fboundp 'make-thread)
+  ;;(when futur-use-threads
   ;;  (futur--make-thread
   ;;   (lambda ()
   ;;     (while t (accept-process-output nil (* 60 60 24))))
@@ -336,10 +340,11 @@ A futur has 3 possible states:
 - (futur-done VAL): in that state, `clients' is `t', and `value' holds VAL.
 - (futur-failed ERR): in that state, `clients' is `error', and `value' holds ERR.
 - (futur-waiting BLOCKER CLIENTS): in that state, `clients' is a list
-  of \"callbacks\" waiting for the value or the error, and `value' holds
+  of \"callbacks\" of the form (FUTUR . FUN) meaning that FUTUR is waiting
+  to receive the ERR and VAL via FUN, and `value' holds
   the BLOCKER that will deliver the value (can be another future,
   a process, a thread, a list (of futures), or possibly other objects
-  with a `futur-blocker-wait' method)."
+  with `futur-blocker-wait/abort' methods)."
   (clients nil)
   (value nil))
 
@@ -380,7 +385,7 @@ A futur has 3 possible states:
        ;; Don't run the clients directly from here, so we don't nest,
        ;; and also because we may be in an "interrupt" context where
        ;; operations like blocking could be dangerous.
-       (futur--funcall client err val)))
+       (futur--funcall (cdr client) err val)))
     ((futur--failed `(futur-aborted . ,_))
      nil)     ;; Just ignore the late delivery.
     ((pred futur--p)
@@ -427,15 +432,18 @@ The error is `futur-aborted'.  Does nothing if FUTUR was already complete."
   (pcase futur
     ((futur--waiting blocker)
      (let ((error (list 'futur-aborted reason)))
-       (futur-blocker-abort blocker error)
+       (futur-blocker-abort blocker error futur)
        (futur-deliver-failure futur error)))
     (_ nil))) ;; No point in throwing away the result we already got.
 
 ;;;; Composing futures
 
-(defun futur--register-callback (futur fun &optional now-ok)
+(defun futur--register-callback (fun futur &optional cfut now-ok)
+  ;; FIXME: Add info about the downstream future for abort's purpose.
   "Call FUN when FUTUR completes.
-Calls it with two arguments (ERR VAL), where only one of the two is non-nil,
+CFUT if non-nil is another future which is waiting for FUTUR to complete
+and will receive its result via FUN.
+Calls FUN with two arguments (ERR VAL), where only one of the two is non-nil,
 and throws away the return value.  If FUTUR fails ERR is the error object,
 otherwise ERR is nil and VAL is the result value.
 When FUN is called, FUTUR is already marked as completed.
@@ -444,7 +452,7 @@ If NOW-OK is non-nil, it means that we can call FUN in the current
 dynamic context, otherwise, always go through `futur--funcall'."
   (pcase futur
     ((futur--waiting _ clients)
-     (setf (futur--clients futur) (cons fun clients)))
+     (setf (futur--clients futur) (cons (cons cfut fun) clients)))
     ((futur--failed err) (funcall (if now-ok #'funcall #'futur--funcall)
                                   fun err nil))
     ((futur--done val) (funcall (if now-ok #'funcall #'futur--funcall)
@@ -490,15 +498,16 @@ and not necessarily in the current-buffer either."
     (if (not (futur--p futur))
         (futur--funcall #'futur--run-continuation new fun (list futur))
       (futur--register-callback
-       futur (lambda (err val)
-               (cond
-                ((null err) (futur--run-continuation new fun (list val)))
-                (t
-                 (futur--handle-error
-                  error-fun err
-                  (lambda (error-fun err)
-                    (futur--run-continuation new error-fun (list err)))
-                  (lambda (err) (futur-deliver-failure new err))))))))
+       (lambda (err val)
+         (cond
+          ((null err) (futur--run-continuation new fun (list val)))
+          (t
+           (futur--handle-error
+            error-fun err
+            (lambda (error-fun err)
+              (futur--run-continuation new error-fun (list err)))
+            (lambda (err) (futur-deliver-failure new err))))))
+       futur new))
     new))
 
 (defun futur-funcall (func &rest args)
@@ -517,10 +526,10 @@ The call takes place in an empty dynamic context."
             (futur-deliver-value futur res)
           (setf (futur--blocker futur) res)
           (futur--register-callback
-           res (lambda (err val)
+           (lambda (err val)
                  (if err (futur-deliver-failure futur err)
-                   (futur-deliver-value futur val)))
-           'now-ok)))
+                  (futur-deliver-value futur val)))
+           res futur 'now-ok)))
     (t (futur-deliver-failure futur err))))
 
 (defun futur--resignal (error-object)
@@ -563,8 +572,9 @@ as `futur-bind'."
                    (condition (make-condition-variable mutex)))
               (with-mutex mutex
                 (futur--register-callback
-                 futur (lambda (_err _val)
-                         (with-mutex mutex (condition-notify condition))))
+                 (lambda (_err _val)
+                  (with-mutex mutex (condition-notify condition)))
+                 futur)
                 (condition-wait condition))))
         ;; FIXME: Use `handler-bind' instead of `futur--resignal'.
         (quit (futur-abort futur err) (futur--resignal err))))
@@ -582,26 +592,36 @@ binding the result in VAR.  BODY is executed at the very end and should
 return a future.
 BODY can start with `:error-fun ERROR-FUN' in which case errors in
 the futures in BINDINGS will cause execution of ERROR-FUN instead of BODY.
-ERROR-FUN works like the third argument of `futur-bind'."
+ERROR-FUN can be:
+- A lambda-expression taking an error descriptor as argument,
+- A list of (CONDITION (VAR) BODY...) where BODY
+  will be executed with VAR bound to the error descriptor if CONDITION
+  is one of the error's condition names."
+  ;; FIXME: ERROR-FUN shouldn't be an expression.
   (declare (indent 1) (debug ((&rest (sexp . [&or ("<-" form) (form)])) body)))
   (cl-assert lexical-binding)
-  (let ((error-fun (when (eq :error-fun (car body))
-                    (prog1 (cadr body)
-                      (setq body (cddr body))))))
-    (if (not (symbolp error-fun))
-        (macroexp-let2 nil error-fun error-fun
-          `(futur-let* ,bindings :error-fun ,error-fun ,@body))
-      (named-let loop ((bindings bindings))
-        (pcase-exhaustive bindings
-          ('() (macroexp-progn body))
-          (`((,var ,exp) . ,bindings)
-           ;; FIXME: Catch errors in EXP, to run `error-fun'?
-           `(pcase-let ((,var ,exp)) ,(loop bindings)))
-          (`((,var <- ,exp) . ,bindings)
-           ;; FIXME: Catch errors in EXP, to run `error-fun'?
-           `(futur-bind ,exp
-                        (pcase-lambda (,var) ,(loop bindings))
-                        ,error-fun)))))))
+  (let* ((error-fun (when (eq :error-fun (car body))
+                      (prog1 (cadr body)
+                        (setq body (cddr body)))))
+         (error-fun-form
+          (pcase-exhaustive error-fun
+            ('nil nil)
+            ((or `(lambda . ,_) (pred symbolp)) error-fun)
+            ((pred consp)
+             `(list
+               ,@(mapcar (lambda (x) `(cons ',(car x) (lambda . ,(cdr x))))
+                         error-fun))))))
+    (named-let loop ((bindings bindings))
+      (pcase-exhaustive bindings
+        ('() (macroexp-progn body))
+        (`((,var ,exp) . ,bindings)
+         ;; FIXME: Catch errors in EXP, to run `error-fun'?
+         `(pcase-let ((,var ,exp)) ,(loop bindings)))
+        (`((,var <- ,exp) . ,bindings)
+         ;; FIXME: Catch errors in EXP, to run `error-fun'?
+         `(futur-bind ,exp
+                      (pcase-lambda (,var) ,(loop bindings))
+                      ,error-fun-form))))))
 
 (oclosure-define futur--aux
   "An auxiliary function used internally.
@@ -632,8 +652,8 @@ The return value of FUN is ignored."
   (let ((futur (futur--ize futur)))
     ;; Use `futur--aux' to let `futur--multi-clients-p' know not to count
     ;; this function as a "real" client.
-    (futur--register-callback futur (oclosure-lambda (futur--aux) (_ _)
-                                      (funcall fun)))
+    (futur--register-callback
+     (oclosure-lambda (futur--aux) (_ _) (funcall fun)) futur)
     futur))
 
 (defmacro futur-unwind-protect (form &rest forms)
@@ -679,32 +699,34 @@ Return non-nil if we successfully waited until the completion of BLOCKER."
 
 (define-error 'futur-aborted "Future aborted: ")
 
-(cl-defgeneric futur-blocker-abort (futur error)
-  "Abort processing of FUTUR and all of its clients.
-If it had not been computed yet, then make it fail with ERROR.")
+(cl-defgeneric futur-blocker-abort (blocker error futur)
+  "Abort processing of BLOCKER because FUTUR failed with ERROR.")
 
-(cl-defmethod futur-blocker-abort ((futur futur) error)
-  (pcase futur
-    ((futur--waiting _ (pred futur--multi-clients-p))
-     ;; If there are more than 1 clients, presumably someone else is
-     ;; still interested in FUTURs result, so we shouldn't abort it.
-     ;; FIXME: We should "unbind" ourselves from it, tho, otherwise
-     ;; when it completes it will deliver its result to us.
-     nil)
-    ((futur--waiting blocker clients)
-     ;; If CLIENTS has only one "real" element, it's presumably the future
-     ;; we're in the process of aborting (call it CHILD), so there's
-     ;; no harm in aborting FUTUR.  We should not just `futur-abort'
-     ;; FUTUR because we shouldn't run CHILD's client, but we should
-     ;; still run the other (auxiliary/cleanup) functions.
-     (futur-blocker-abort blocker error)
-     (setf (futur--clients futur) 'error)
-     (setf (futur--value futur) error)
-     (dolist (client clients)
-       (when (cl-typep client 'futur--aux)
-         (futur--funcall client error nil))))))
+(cl-defmethod futur-blocker-abort ((blocker futur) error futur)
+  (pcase blocker
+    ((futur--waiting pblocker clients)
+     (let ((c (assq futur clients)))
+       (cl-assert c)
+       (if (futur--multi-clients-p clients)
+           ;; If there are more than 1 clients, presumably someone else is
+           ;; still interested in FUTURs result, so we shouldn't abort it.
+           (progn
+             ;; But we can unregister ourselves from its callbacks.
+             (setf (futur--clients blocker) (delq c clients))
+             nil)
+         ;; If CLIENTS has only one "real" element, it's presumably the future
+         ;; we're in the process of aborting (call it CHILD), so there's
+         ;; no harm in aborting FUTUR.  We should not just `futur-abort'
+         ;; FUTUR because we shouldn't run CHILD's client, but we should
+         ;; still run the other (auxiliary/cleanup) functions.
+         (futur-blocker-abort pblocker error blocker)
+         (setf (futur--clients blocker) 'error)
+         (setf (futur--value blocker) error)
+         (dolist (client clients)
+           (when (cl-typep client 'futur--aux)
+             (futur--funcall client error nil))))))))
 
-(cl-defmethod futur-blocker-abort ((_ (eql nil)) _error)
+(cl-defmethod futur-blocker-abort ((_ (eql nil)) _error _futur)
   ;; No blocker to abort.
   nil)
 
@@ -758,7 +780,7 @@ Returns non-nil if it waited the full TIME."
         (if (> delay 1) (sit-for 0)))) ;; Redisplay every 1s, just in case.
     t))
 
-(cl-defmethod futur-blocker-abort ((timer (head timer)) _error)
+(cl-defmethod futur-blocker-abort ((timer (head timer)) _error _futur)
   (setq timer (cdr timer))
   ;; Older versions of Emacs signal errors if we try to cancel a timer
   ;; that's already run (or been canceled).
@@ -821,8 +843,9 @@ FUNC is called in an empty dynamic context."
   (let ((new (apply func args)))
     (push new futur--concurrency-bound-active)
     (futur--register-callback
-     new (oclosure-lambda (futur--aux) (_ _)
-           (futur--concurrency-bound-next new)))
+     (oclosure-lambda (futur--aux) (_ _)
+       (futur--concurrency-bound-next new))
+     new)
     new))
 
 (defun futur--concurrency-bound-next (done)
@@ -836,10 +859,10 @@ FUNC is called in an empty dynamic context."
           ((futur--waiting)
            (let ((new (futur--concurrency-bound-start (car call) (cdr call))))
              (futur--register-callback
-              new (lambda (err val) (futur--deliver fut err val)) 'now-ok)
+              (lambda (err val) (futur--deliver fut err val)) new fut 'now-ok)
              (cl-return))))))))
 
-(cl-defmethod futur-blocker-abort ((_ (eql 'waiting)) _error)
+(cl-defmethod futur-blocker-abort ((_ (eql 'waiting)) _error _futur)
   nil)
 
 ;;;; Processes
@@ -933,7 +956,7 @@ The DISPLAY argument is ignored: redisplay always happens."
       (sit-for 0)) ;; Redisplay every 1s, just in case.
     t))
 
-(cl-defmethod futur-blocker-abort ((proc process) _error)
+(cl-defmethod futur-blocker-abort ((proc process) _error _futur)
   (delete-process proc))
 
 (defun futur-process-send (proc string)
@@ -950,7 +973,7 @@ The DISPLAY argument is ignored: redisplay always happens."
     (thread-join th)
     t))
 
-(cl-defmethod futur-blocker-abort ((th thread) error)
+(cl-defmethod futur-blocker-abort ((th thread) error _futur)
   ;; FIXME: This doesn't guarantee that the thread is aborted.
   ;; FIXME: Let's hope that the undocumented feature of `signal' applies
   ;; also to `thread-signal'.
@@ -971,7 +994,6 @@ that have not yet completed."
            (i 0))
      (dolist (futur futurs)
        (futur--register-callback
-        futur
         (let ((cell (nthcdr i args)))
           (lambda (err val)
             (cl-assert (eq :futur--waiting-for-result (car cell)))
@@ -982,7 +1004,7 @@ that have not yet completed."
               (futur-deliver-failure new err)
               ;; Abort the remaining ones.
               (let ((abort-error (list 'futur-aborted `(futur-list . ,err))))
-                (futur-blocker-abort futurs abort-error)))
+                (futur-blocker-abort futurs abort-error new)))
              (t
               (setf (car cell) val)
               (setq count (1- count))
@@ -992,7 +1014,7 @@ that have not yet completed."
                   ;; when aborting, so ignore their delivery here.
                   ((futur--failed `(futur-aborted . ,_)) nil)
                   (_ (futur-deliver-value new args))))))))
-        'now-ok)
+        futur new 'now-ok)
        (setq i (1+ i)))
       new)))
 
@@ -1003,15 +1025,14 @@ future also completes with that same failure."
   (let* ((new (futur--waiting futurs)))
     (dolist (futur futurs)
       (futur--register-callback
-       futur
        (lambda (err val)
          (pcase new
            ((futur--waiting)
             (futur--deliver new err val)
             ;; Abort the remaining ones.
             (let ((abort-error (list 'futur-aborted 'futur-race)))
-              (futur-blocker-abort futurs abort-error)))))
-       'now-ok))
+              (futur-blocker-abort futurs abort-error new)))))
+       futur new 'now-ok))
     new))
 
 (cl-defmethod futur-blocker-wait ((_blockers cons))
@@ -1026,10 +1047,10 @@ future also completes with that same failure."
   ;;  waited)
   nil)
 
-(cl-defmethod futur-blocker-abort ((futurs cons) error)
+(cl-defmethod futur-blocker-abort ((futurs cons) error cfut)
   ;; Propagate the abort to the futurs we're still waiting for.
   (dolist (futur futurs)
-    (futur-blocker-abort futur error)))
+    (futur-blocker-abort futur error cfut)))
 
 ;; FIXME: Make futures that returns synchronously if the result
 ;; is obtained before a specific timeout, or continue
@@ -1082,7 +1103,7 @@ URL-encoded before it's used."
 
 ;; (cl-defmethod futur-blocker-wait ((blocker (head url-retrieve))) nil)
 
-(cl-defmethod futur-blocker-abort ((blocker (head url-retrieve)) _error)
+(cl-defmethod futur-blocker-abort ((blocker (head url-retrieve)) _error _futur)
   ;; AFAIK the URL library doesn't provide support for aborting
   ;; a request, so this is a best-effort attempt.
   (when (buffer-live-p (cdr blocker))
