@@ -41,6 +41,8 @@
 (defvar futur--read-from-minibuffer
   (symbol-function 'read-from-minibuffer))
 
+(defvar futur--initial-buffer-list (mapcar #'buffer-name (buffer-list)))
+
 (defun futur--read-stdin ()
   "Read a sexp from a single line on stdin."
   (unless noninteractive (error "futur--read-stdin works only in batch mode"))
@@ -69,7 +71,7 @@
 ;;   (futur--obarray ctxname ctx)
 ;;   (apply func args))
 
-(define-error futur-inhibited-interaction
+(define-error 'futur-inhibited-interaction
               "Interaction inhibited in futur servers")
 
 (defun futur-server ()
@@ -82,7 +84,7 @@
                     ;; FIXME: There are still ways to try and read from stdin,
                     ;; e.g. via `interactive' specs.
                     ))
-      (fset fun errorun)))
+      (fset fun errorfun)))
   ;; FIXME: Prevent client code from using stdout?
 
   ;; We want the `futur-client' to be able to interrupt long-running
@@ -231,6 +233,13 @@ NAME is used only for the purpose of overwriting a previous state from
 the cache."
       (when (and target (null snapshots))
         (error "`futur--obarray' was not properly initialized: %S" target))
+      ;; Kill buffers except the initial ones.  Part of the reason is
+      ;; "cleanliness" but part of the reason is also that those buffer's
+      ;; local vars can refer to variables and functions which we're about
+      ;; to undefine!
+      (dolist (buf (buffer-list))
+        (unless (member (buffer-name buf) futur--initial-buffer-list)
+          (kill-buffer buf)))
       (pcase-let (;; (start-time (float-time))
                   (`(,_ ,old-target ,snapshot) (assq name snapshots)))
         (cond
