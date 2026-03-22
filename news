@@ -1,8 +1,10 @@
 Version 1.3:
 
+- New function `futur-register-unwind-protect`.
 - Syntax of `:error-fun' changed in `futur-let*'.
 - Remove `idle' argument from `futur-timeout'.
 - Adjusted `futur-hacks-mode' to changes in Emacs `master'.
+- Added an asynchronous byte-compile-file to `futur-hacks-mode'.
 
 Version 1.2:
 
