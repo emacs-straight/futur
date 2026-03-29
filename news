@@ -1,6 +1,8 @@
 Since version 1.4:
 
 - Emit warnings for unused (non-nil) return values.
+- New debug var `futur-elisp--include-extra-debug-info'.
+- `futur-client.el' is now called `futur-elisp.el'.
 
 Version 1.4:
 

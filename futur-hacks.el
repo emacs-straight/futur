@@ -25,17 +25,17 @@
 
 ;; (require 'trace)
 ;; (trace-function 'flymake--log-1)
-;; (trace-function 'futur--elisp-process-sentinel)
-;; (trace-function 'futur--elisp-process-answer)
-;; (trace-function 'futur--elisp-process-filter)
-;; (trace-function 'futur--elisp-set-destination)
+;; (trace-function 'futur-elisp--process-sentinel)
+;; (trace-function 'futur-elisp--process-answer)
+;; (trace-function 'futur-elisp--process-filter)
+;; (trace-function 'futur-elisp--set-destination)
 ;; (trace-function 'elisp-flymake--byte-compile-done)
 ;; (trace-function 'futur--smerge-refine-regions)
 ;; (trace-function 'futur--smerge-refine-regions-1)
 ;; (trace-function 'futur-process-call)
 ;; (trace-function 'smerge--refine-apply-diff)
 
-(require 'futur-client)
+(require 'futur-elisp)
 (require 'cl-lib)
 
 ;;;; Safe macroexpansion in a sandbox.
@@ -50,7 +50,7 @@
                          (lambda (f) (string-match-p "/leim-list\\.el" f))
                          totalctx))
           (trimmedctx (take (- (length totalctx) (length tail)) totalctx)))
-     (futur--sandbox-funcall
+     (futur-elisp-sandbox--funcall
       (lambda ()
         (declare-function futur-reset-context "futur-server")
         ;; FIXME: If `futur-reset-context' is sufficiently fast, we could
@@ -82,7 +82,7 @@ current buffer state and calls REPORT-FN when done."
   (let ((temp-file (make-temp-file
                     (expand-file-name
                      "elisp-flymake-byte-compile"
-                     (futur-sandbox-temp-dir))))
+                     (futur-elisp-sandbox-temp-dir))))
         (source-buffer (current-buffer))
         (coding-system-for-write 'utf-8-unix)
         (coding-system-for-read 'utf-8))
@@ -97,7 +97,7 @@ current buffer state and calls REPORT-FN when done."
            ;; *scratch* buffers.
            (inhibit-lcw (derived-mode-p 'lisp-interaction-mode))
            (proc-futur
-            (futur--sandbox-funcall
+            (futur-elisp-sandbox--funcall
              (lambda ()
                (declare-function futur-reset-context "futur-server")
                (futur-reset-context 'flymake
@@ -359,7 +359,7 @@ place in a clean environment."
   (if (or noninteractive load args)
       ;; Should we also support the "and load" asynchronously?
       (apply orig-fun filename load args)
-    (let* ((filename (abbreviate-file-name (expand-file-name filename)))
+    (let* ((filename (expand-file-name filename))
            (shortname (file-relative-name filename))
            (loadpath load-path)
            (dir (file-name-directory filename))
@@ -369,41 +369,47 @@ place in a clean environment."
             ;; even if we trusted the `.el'!  :-(
             ;; Also it would take extra work since the sandbox can't
             ;; directly write the `.elc' file.
-            (futur--elisp-funcall
+            (futur-elisp--funcall
              (lambda ()
                (declare-function futur-reset-context "futur-server")
                (futur-reset-context 'flymake
                                     `((funcall package-activate-all)
                                       elisp-mode bytecomp byte-opt))
                (setq load-path loadpath)
-               (when (get-buffer byte-compile-log-buffer)
-                 (with-current-buffer byte-compile-log-buffer
-                   (let ((inhibit-read-only t))
-                     (erase-buffer))))
+               (with-current-buffer (get-buffer-create byte-compile-log-buffer)
+                 (let ((inhibit-read-only t))
+                   (setq default-directory dir) ;Try and avoid "leaving dir".
+                   (erase-buffer)))
                (let ((noninteractive nil)) ;Don't report warnings on stderr.
                  (byte-compile-file filename))
-               (when (get-buffer byte-compile-log-buffer)
-                 (with-current-buffer byte-compile-log-buffer
-                   (buffer-string)))))))
+               (with-current-buffer byte-compile-log-buffer
+                 (buffer-string))))))
       (message "Started compilation in the background for: %s" shortname)
       (futur-bind
        proc-futur
        (lambda (log-buffer-contents)
-         (if (null log-buffer-contents)
-             (message "Compilation completed successfully for: %s" shortname)
-           (message "Compilation completed for: %s" shortname)
-           (with-current-buffer (get-buffer-create byte-compile-log-buffer)
+         (message "Compilation completed for: %s" shortname)
+         (with-current-buffer (get-buffer-create byte-compile-log-buffer)
+           (let* ((old (point-max))
+                  (compiling-line-rx "\f\nCompiling .*\n")
+                  (compiling-line
+                   (when (string-match compiling-line-rx log-buffer-contents)
+                     (prog1 (match-string 0 log-buffer-contents)
+                       (setq log-buffer-contents
+                             (replace-match "" t t log-buffer-contents))))))
+             (let ((byte-compile-current-file filename))
+               (byte-compile-log-file))
              (let ((inhibit-read-only t))
                (goto-char (point-max))
-               (insert log-buffer-contents))
-             (setq default-directory dir)
-	     (setq byte-compile-last-logged-file filename
-		   byte-compile-last-warned-form nil)
-	     ;; Do this after setting default-directory.
-	     (unless (derived-mode-p 'compilation-mode)
-               (emacs-lisp-compilation-mode))
-             ;; FIXME: Don't display buffer if there were no warnings!
-             (display-buffer (current-buffer)))))))))
+               (when compiling-line
+                 (if (not (re-search-backward compiling-line-rx old t))
+                     (insert compiling-line)
+                   (replace-match compiling-line t t)
+                   (goto-char (point-max))))
+               (insert log-buffer-contents)))
+           (unless (equal log-buffer-contents "")
+             (display-buffer (current-buffer)))
+           nil))))))
 
 ;; (defun futur--dummy (a b)
 ;;   a (prut (list a)))
