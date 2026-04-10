@@ -49,18 +49,26 @@
                              #'cl-member-if))
                          (lambda (f) (string-match-p "/leim-list\\.el" f))
                          totalctx))
-          (trimmedctx (take (- (length totalctx) (length tail)) totalctx)))
+          (trimmedctx (take (- (length totalctx) (length tail)) totalctx))
+          (lp load-path)
+          ;; Loading the files will usually end up setting `load-path' for
+          ;; us, but not always.  Especially since `trimmedctx'
+          ;; has the files in the order their `load' ended, whereas we
+          ;; control only the order in which they're started.
+          (set-lp (lambda () (setq load-path lp))))
      (futur-elisp-sandbox--funcall
       (lambda ()
         (declare-function futur-reset-context "futur-server")
         ;; FIXME: If `futur-reset-context' is sufficiently fast, we could
         ;; just call it unconditionally.
         (let ((ctx trimmedctx))
-          (while (and ctx (member (car ctx) load-history))
+          (while (and ctx (assoc (car ctx) load-history))
             (setq ctx (pop ctx)))
           (when ctx ;; Some element from context is missing.
             (futur-reset-context
-             'elisp-macroexpand (reverse trimmedctx))))
+             'elisp-macroexpand
+             `((funcall ,set-lp)
+               ,@(nreverse trimmedctx)))))
         (setq trusted-content :all) ;; We're in the sandbox!
         (if (fboundp 'elisp--safe-macroexpand-all) ;Emacs-30?
             (elisp--safe-macroexpand-all sexp)
@@ -83,12 +91,11 @@ current buffer state and calls REPORT-FN when done."
                     (expand-file-name
                      "elisp-flymake-byte-compile"
                      (futur-elisp-sandbox-temp-dir))))
-        (source-buffer (current-buffer))
-        (coding-system-for-write 'utf-8-unix)
-        (coding-system-for-read 'utf-8))
+        (source-buffer (current-buffer)))
     (save-restriction
       (widen)
-      (write-region (point-min) (point-max) temp-file nil 'nomessage))
+      (let ((coding-system-for-write 'emacs-internal))
+        (write-region (point-min) (point-max) temp-file nil 'nomessage)))
     ;; In the original code, the `expand-file-name' is done "implicitly"
     ;; by the processing of the `-L' command line argument.
     (let* ((loadpath (mapcar #'expand-file-name
@@ -356,6 +363,7 @@ current buffer state and calls REPORT-FN when done."
 The advantages are that this does not block the main Emacs process,
 it can take advantage of idle CPU resources, and the compilation takes
 place in a clean environment."
+  ;; FIXME: futur-concurrency-bound?  Recompile directory?  package-install?
   (if (or noninteractive load args)
       ;; Should we also support the "and load" asynchronously?
       (apply orig-fun filename load args)
