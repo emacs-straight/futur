@@ -6,6 +6,7 @@ Since version 1.4:
 
 Version 1.4:
 
+- `:error-fun' renamed to `on-error' in `futur-let*'.
 - New function `futur-register-unwind-protect`.
 - `futur-hacks-mode' now also makes `byte-compile-file' asynchronous.
 - Bug fixes.
