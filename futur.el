@@ -167,6 +167,8 @@
 
 ;; Since version 1.4:
 
+;; - New synchronization objects: full/empty cells and semaphores.
+;; - New type for "mines" used internally for synchronization objects.
 ;; - Emit warnings for unused (non-nil) return values.
 ;; - New debug var `futur-elisp--include-extra-debug-info'.
 ;; - `futur-client.el' is now called `futur-elisp.el'.
@@ -248,6 +250,35 @@ that it is not empty."
 (defun futur--queue-requeue (queue val)
   "Push VAL back to the head of the QUEUE."
   (push val (futur--queue-head queue)))
+
+(defun futur--queue-iter (queue fun)
+  "Iterate over the elements of QUEUE.
+FUN is called with each element in turn and should return a list.
+If the list contains `delete', then the element is removed from the queue.
+If the list contains `stop' then the iteration ends.
+Only a single iteration can proceed on a given queue at the same time."
+  (let ((prevcell t)
+        (cells (futur--queue-head queue)))
+    (unless cells
+      (let ((tail (futur--queue-revtail queue)))
+        (setf (futur--queue-head queue) (setq cells (nreverse tail)))
+        (setf (futur--queue-revtail queue) nil)))
+    (while cells
+      (cl-assert (eq cells (if (consp prevcell) (cdr prevcell)
+                             (futur--queue-head queue))))
+      (let ((res (funcall fun (car cells))))
+        (if (not (memq 'delete res))
+            (setq prevcell cells)
+          (setf (if (consp prevcell) (cdr prevcell) (futur--queue-head queue))
+                (cdr cells)))
+        (if (memq 'stop res) (setq cells nil)
+          (unless (setq cells (cdr cells))
+            (let ((revtail (futur--queue-revtail queue)))
+              (when revtail
+                (setf (if (consp prevcell) (cdr prevcell)
+                       (futur--queue-head queue))
+                      (setq cells (nreverse revtail)))
+                (setf (futur--queue-revtail queue) nil)))))))))
 
 (defvar futur--pending (futur--queue)
   "Pending operations.")
@@ -871,6 +902,73 @@ Returns non-nil if it waited the full TIME."
   ;; that's already run (or been canceled).
   (unless (futur--timer-access #'timer--triggered timer) (cancel-timer timer)))
 
+;;;; Synchronization
+
+(cl-defstruct (futur--mine
+               (:noinline t)
+               (:constructor nil))
+  active ;; Used only for debugging purposes.
+  (waiting (futur--queue)))
+
+(cl-defgeneric futur--mine-fetch (mine arg)
+  "Try to extract ARG resources from MINE.
+Return the resource if available and nil if it's not.")
+
+(cl-defgeneric futur--mine-return (mine rsc)
+  "Return resource RSC to the MINE.")
+
+(defun futur-mine-wait (mine &optional arg)
+  "Return a futur that extracts and returns ARG resources from MINE."
+  (let ((rsc (futur--mine-fetch mine arg)))
+    (if rsc (futur-done rsc)
+      (let ((new (futur--waiting 'waiting)))
+        (futur--queue-enqueue (futur--mine-waiting mine) (cons new arg))
+        new))))
+
+(cl-defmethod futur-blocker-abort ((_ (eql 'waiting)) _error _futur)
+  nil)
+
+(defun futur-mine-release (mine &optional rsc done)
+  "Return resource RSC to MINE."
+  ;; (trace-values :in (futur--concurrency-mine-count mine)
+  ;;               futur-concurrency-bound)
+  (cl-callf (lambda (futs) (delq done futs)) (futur--mine-active mine))
+  (futur--mine-return mine rsc)
+  (futur--queue-iter
+   (futur--mine-waiting mine)
+   (lambda (elem)
+     ;; (trace-values :considering elem)
+     (pcase-let ((`(,fut . ,arg) elem))
+       (pcase fut
+         ((or (futur--waiting)
+              ;; Tell Pcase to presume FUTUR *is* a futur.
+              (and (pred (not futur--p)) pcase--dontcare))
+          (let ((rsc (futur--mine-fetch mine arg)))
+            ;; FIXME: For some mines, we'd actually like to stop scanning
+            ;; the queue as soon as we found someone to wake up and/or as
+            ;; soon as we find someone we can't wake up.
+            (if rsc
+                (progn (futur-deliver-value fut rsc)
+                       '(delete))
+              nil)))
+         (_ '(delete)))))))
+
+(defun futur-mine-call-with (body-fun mine &optional arg)
+  (futur-let* ((rsc <- (futur-mine-wait mine arg)))
+    (let* ((active (list body-fun))
+           (_ (push active (futur--mine-active mine)))
+           (fut (funcall body-fun rsc)))
+      (setcdr active fut)
+      (futur-unwind-protect fut
+        (futur-mine-release mine rsc active)))))
+
+(defmacro futur-with-resource (spec &rest body)
+  "Run BODY with RSC bound to ARG resources from MINE.
+\n(fn (RSC MINE &optional ARG) &rest BODY)"
+  (declare (debug t) (indent 1))
+  (pcase-let ((`(,rsc ,mine ,arg) spec))
+    `(futur-mine-call-with (lambda (,rsc) ,@body) ,mine ,arg)))
+
 ;;;; Bounding concurrent resource usage
 
 ;; This is a crude support to limit the amount of concurrency.
@@ -908,12 +1006,22 @@ Returns non-nil if it waited the full TIME."
     2)
   "Maximum number of concurrent subprocesses.")
 
-(defvar futur--concurrency-bound-active nil
-  "List of active process-futures.")
+(cl-defstruct (futur--concurrency-mine
+               (:include futur--mine)
+               (:constructor nil)
+               (:predicate nil)
+               (:constructor futur--concurrency-mine ()))
+  (count 0))
 
-(defvar futur--concurrency-bound-waiting (futur--queue)
-  "Queue of futures waiting to start
-Each element is of the form (FUTURE FUN . ARGS).")
+(defconst futur--concurrency-mine (futur--concurrency-mine))
+
+(cl-defmethod futur--mine-fetch ((mine futur--concurrency-mine) _arg)
+  (when (< (futur--concurrency-mine-count mine) futur-concurrency-bound)
+    (cl-incf (futur--concurrency-mine-count mine))
+    t))
+
+(cl-defmethod futur--mine-return ((mine futur--concurrency-mine) _rsc)
+  (cl-decf (futur--concurrency-mine-count mine)))
 
 (defun futur-concurrency-bound (func &rest args)
   "Call FUNC with ARGS while limiting the amount of concurrency.
@@ -922,35 +1030,62 @@ The amount of concurrently active futures is determined by the variable
 `futur-concurrency-bound' and considers only those futures constructed
 via the function `futur-concurrency-bound'.
 FUNC is called in an empty dynamic context."
-  (if (< (length futur--concurrency-bound-active) futur-concurrency-bound)
-      (futur--concurrency-bound-start #'futur-funcall (cons func args))
-    (let ((new (futur--waiting 'waiting)))
-      (futur--queue-enqueue futur--concurrency-bound-waiting
-                            `(,new ,func . ,args))
-      new)))
+  (futur-with-resource (_ futur--concurrency-mine)
+    (apply func args)))
 
-(defun futur--concurrency-bound-start (func args)
-  (let ((new (apply func args)))
-    (push new futur--concurrency-bound-active)
-    (futur-unwind-protect new
-      (futur--concurrency-bound-next new))))
+;;;; Full/Empty cells.
 
-(defun futur--concurrency-bound-next (done)
-  (setq futur--concurrency-bound-active
-        (delq done futur--concurrency-bound-active))
-  (cl-block nil
-    (while (not (futur--queue-empty-p futur--concurrency-bound-waiting))
-      (pcase-let ((`(,fut . ,call)
-                   (futur--queue-dequeue futur--concurrency-bound-waiting)))
-        (pcase fut
-          ((futur--waiting)
-           (let ((new (futur--concurrency-bound-start (car call) (cdr call))))
-             (futur--register-callback
-              (lambda (err val) (futur--deliver fut err val)) new fut 'now-ok)
-             (cl-return))))))))
+(cl-defstruct (futur-fe
+               (:include futur--mine)
+               (:conc-name futur-fe--)
+               (:constructor nil)
+               (:constructor futur-fe ()))
+  (contents nil))
 
-(cl-defmethod futur-blocker-abort ((_ (eql 'waiting)) _error _futur)
+(cl-defmethod futur--mine-fetch ((fe futur-fe) arg)
+  (let* ((c (futur-fe--contents fe))
+         (res (xor arg c)))
+    (when res
+      (setf (futur-fe--contents fe) arg)
+      ;; Wake up threads, if applicable.  Delay it with `futur--funcall',
+      ;; because we may be within a `futur--queue-iter'!
+      (futur--funcall #'futur-mine-release fe)
+      res)))
+
+(cl-defmethod futur--mine-return ((_fe futur-fe) _rsc)
   nil)
+
+(defun futur-fe-fill (fe val)
+  "Construct a futur which puts VAL into the full/empty cell FE.
+VAL can be any value except nil."
+  (cl-assert val)
+  (futur-mine-wait fe val))
+
+(defun futur-fe-empty (fe)
+  "Construct a futur which grabs the contents of the full/empty cell FE."
+  (futur-mine-wait fe nil))
+
+;;;; Semaphore
+
+(cl-defstruct (futur-sem
+               (:include futur--mine)
+               (:conc-name futur-sem--)
+               (:constructor nil)
+               (:constructor futur-sem (&optional val)))
+  (val 1))
+
+(cl-defmethod futur--mine-fetch ((sem futur-sem) arg)
+  (unless count (setq count 1))
+  (cl-assert (>= count 0))
+  (let ((v (futur-sem--val sem)))
+    (when (<= arg v)
+      (setf (futur-sem--val sem) (- v arg))
+      arg)))
+
+(cl-defmethod futur--mine-return ((sem futur-sem) rsc)
+  (unless count (setq count 1))
+  (cl-assert (>= count 0))
+  (cl-incf (futur-sem--val sem) rsc))
 
 ;;;; Processes
 

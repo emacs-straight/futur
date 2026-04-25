@@ -191,17 +191,25 @@
         (delete-file tmpfile)))))
 
 (ert-deftest futur-process-bounded ()
-  (let ((run
-         (lambda (times concurrency)
-           (let* ((futures ())
-                  (timescale 1)
-                  (start (float-time))
-                  (futur-concurrency-bound concurrency))
-             (dotimes (_ times)
-               (push (futur-concurrency-bound #'futur-timeout (* timescale 0.1))
-                     futures))
-             (futur-blocking-wait-to-get-result (apply #'futur-list futures))
-             (/ (- (float-time) start) timescale)))))
+  (let* ((old-concurrency futur-concurrency-bound)
+         (run
+          (lambda (times concurrency)
+            (unwind-protect
+                (let* ((futures ())
+                       (timescale 1)
+                       (start (float-time)))
+                  ;; Don't just let-bind `futur-concurrency-bound'
+                  ;; because we need to affect all the threads.
+                  (setq futur-concurrency-bound concurrency)
+                  (dotimes (_ times)
+                    (push (futur-concurrency-bound
+                           #'futur-timeout (* timescale 0.1))
+                          futures))
+                  (futur-blocking-wait-to-get-result
+                   (apply #'futur-list futures))
+                  (/ (- (float-time) start) timescale))
+              (setq futur-concurrency-bound old-concurrency)))))
+    (should (<= 1.0 (funcall run 10 1) 1.2))
     (should (<= 0.5 (funcall run 10 2) 0.7))
     (should (<= 0.3 (funcall run 10 4) 0.5))))
 
@@ -260,6 +268,37 @@
 
 (ert-deftest futur-elisp-sandbox-funcall ()
   (futur--tests-elisp-funcall #'futur-elisp-sandbox--funcall))
+
+(ert-deftest futur-fe ()
+  (let* ((fe (futur-fe))
+         (last-read nil)
+         (emptiers
+          (futur-let*
+              ((y1 <- (futur-fe-empty fe))
+               (_ (setq last-read y1))
+               (y2 <- (futur-fe-empty fe))
+               (_ (setq last-read y2))
+               (y3 <- (futur-fe-empty fe))
+               (_ (setq last-read y3)))
+            (list y1 y2 y3)))
+         (fillers
+          (futur-let*
+              ((x1 last-read)
+               (_ <- (futur-fe-fill fe 1))
+               (x2 last-read)
+               (_ <- (futur-fe-fill fe 2))
+               (x3 last-read)
+               (_ <- (futur-fe-fill fe 3))
+               (x4 last-read)
+               (_ <- (futur-fe-fill fe 3))
+               (x5 last-read))
+            (list x1 (not (memq x2 '(nil 1))) (not (memq x3 '(1 2)))
+                (not (memq x4 '(2 3)))
+                (not (eq x5 3))))))
+    (should (equal (futur-blocking-wait-to-get-result fillers)
+                   '(nil nil nil nil nil)))
+    (should (equal (futur-blocking-wait-to-get-result emptiers)
+                   '(1 2 3)))))
 
 (provide 'futur-tests)
 ;;; futur-tests.el ends here
