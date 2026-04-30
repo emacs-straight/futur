@@ -1,4 +1,4 @@
-Since version 1.4:
+Version 1.5:
 
 - New synchronization objects: full/empty cells and semaphores.
 - New type for "mines" used internally for synchronization objects.
