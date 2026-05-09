@@ -269,37 +269,31 @@ A server kind is a symbol.")
           (futur-deliver-value futur answer)
           nil)
       (process-put proc 'futur--destination futur)
-      `(futur-server . ,proc))))
+      nil)))
 
 (defun futur-elisp--answer-futur (proc)
   (futur-new (lambda (futur)
                (futur-elisp--set-destination proc futur))))
 
-(defun futur-elisp--get-process (kind launcher)
+(defun futur-elisp--get-process (kind launcher &optional continuation)
+  (unless continuation (setq continuation #'identity))
   (let ((ready (seq-find (lambda (proc) (process-get proc 'futur--ready))
                          (alist-get kind futur-elisp--servers))))
-    (if ready (futur-done ready)
-      (futur-let*
-          ((proc (funcall launcher kind))
-           (answer <- (futur-elisp--answer-futur proc)))
-        (if (eq answer :ready)
-            (progn
-              (process-put proc 'futur--ready t)
-              proc)
-          (error "unexpected boot message from futur-server: %S" answer))))))
-
-(cl-defmethod futur-blocker-abort ((blocker (head futur-server)) _ _)
-  ;; Don't kill the server, since we may want to reuse it for other
-  ;; requests.
-  (let ((proc (cdr blocker)))
-    (if (boundp 'kill-emacs-on-sigint)  ;Emacs-31
-        (interrupt-process proc)
-      ;; This USR1 hack doesn't work in Windows and Android.  🙁
-      (signal-process proc 'USR1))))
-
-(cl-defmethod futur-blocker-wait ((_blocker (head futur-server)))
-  ;; FIXME: (while ?? (accept-process-output proc ...))!
-  nil)
+    (if ready (funcall continuation ready)
+      ;; Let's start a new subprocess.
+      ;; If our caller gets aborted before the subprocess is ready,
+      ;; we don't want to abort the subprocess' startup since we'll just
+      ;; keep it around in case someone else wants to use it.
+      (futur-catch-abort
+       #'ignore
+       (futur-let*
+           ((proc (funcall launcher kind))
+            (answer <- (futur-elisp--answer-futur proc)))
+         (if (eq answer :ready)
+             (progn
+               (process-put proc 'futur--ready t)
+               (funcall continuation proc))
+           (error "unexpected boot message from futur-server: %S" answer)))))))
 
 (define-error 'futur-unreadable-answer "Unreadable answer from server")
 
@@ -327,59 +321,76 @@ A server kind is a symbol.")
         (error
          (error "[Futur] Trying to send un`read'able data: %S" err))))))
 
-(defun futur-elisp--funcall-1 (futur-proc func args)
-  (futur-let*
-      ((proc <- futur-proc)
-       (rid
-        ;; FIXME: In Emacs<31, cl-incf on process-get doesn't return
-        ;; the expected value.
-        ;; (cl-incf (process-get proc 'futur--rid))
-        (progn
-          (cl-incf (process-get proc 'futur--rid))
-          (process-get proc 'futur--rid)))
-       (_ (with-temp-buffer
-            ;; (trace-values :funcall rid func args)
-            (process-put proc 'futur--ready nil)
-            (process-put proc 'futur--last-time (float-time))
-            (futur-elisp--print-readably
-             `(,(process-get proc 'futur--sid-sym) ,rid
-               ,func ,@args))
-            (cl-assert (eobp))
-            (insert "\n")
-            (let ((coding-system-for-write 'emacs-internal))
-              (process-send-string proc (buffer-string))
-              ;; (process-send-region proc (point-min) (point-max))
-              )))
-       (read-answer <- (futur-elisp--answer-futur proc)))
-    ;; (trace-values :read-answer read-answer)
-    (pcase read-answer
-      (`(:read-success ,(pred (equal rid)))
-       (futur-let* ((call-answer  <- (futur-elisp--answer-futur proc)))
-         ;; (trace-values :call-answer call-answer)
-         (pcase-exhaustive call-answer
-           (`(:funcall-success ,(pred (equal rid)) . ,val)
-            (process-put proc 'futur--ready t)
-            val)
-           (`(:funcall-error ,(pred (equal rid)) . ,err)
-            (process-put proc 'futur--ready t)
-            (when (stringp (car err)) ;The error is preceded by a backtrace.
-              ;; (message "[Futur] Received error with backtrace: %S\n%s"
-              ;;          (cdr err) (car err))
-              (setq err (nconc (cdr err) (list (car err)))))
-            (futur--resignal err))
-           (`(:unreadable-answer . ,err-data)
-            (process-put proc 'futur--ready t)
-            ;; FIXME: Maybe we should report the whole unreadable string?
-            ;; FIXME: A "common" case is when an error includes un`read'able
-            ;; data, like a buffer, in which case we could convert
-            ;; the error to a `read'able one in `futur-server.el'?
-            (signal 'futur-unreadable-answer err-data)))))
-      (`(:read-success . ,_)
-       ;; (futur--funcall #'futur--client-resync proc)
-       (error "[Futur] Out-of-order reply: %S" read-answer))
-      (_
-       ;; (futur--funcall #'futur--client-resync proc)
-       (error "[Futur] error: %S" read-answer)))))
+(defun futur--elisp-abort-handler (proc)
+  (lambda (_error)
+    (cond
+     ;; `bwrap' just exits when we send SIGINT or SUGUSR1 instead of
+     ;; propagating the signal to the underlying subprocess, leaving
+     ;; the Emacs process running, so better do nothing.  🙁
+     ;; FIXME: Maybe dig into the process tree to find the PID of the
+     ;; `emacs' subprocess underneath the `brwap' process(es)?
+     ;; We can't ask the sandbox to tell us its PID because it
+     ;; always thinks it doesn't know it (it's told it's process 2).
+     ((eq (process-get proc 'futur--kind) 'futur-sandbox) nil)
+     ((boundp 'kill-emacs-on-sigint) (interrupt-process proc)) ;Emacs-31
+     (t (signal-process proc 'USR1)))))
+
+(defun futur-elisp--funcall-1 (proc func args)
+  (cl-assert (process-get proc 'futur--ready))
+  (futur-catch-abort
+   ;; Upon abortion, tell the subprocess to interrupt the current job,
+   ;; but without aborting the protocol so we stay in sync and the
+   ;; subprocess can be reused as intended.
+   (futur--elisp-abort-handler proc)
+   (futur-let*
+       ((rid
+         ;; FIXME: In Emacs<31, cl-incf on process-get doesn't return
+         ;; the expected value.
+         ;; (cl-incf (process-get proc 'futur--rid))
+         (progn
+           (cl-incf (process-get proc 'futur--rid))
+           (process-get proc 'futur--rid)))
+        (_ (with-temp-buffer
+             ;; (trace-values :funcall rid func args)
+             (process-put proc 'futur--ready nil)
+             (process-put proc 'futur--last-time (float-time))
+             (futur-elisp--print-readably
+              `(,(process-get proc 'futur--sid-sym) ,rid
+                ,func ,@args))
+             (cl-assert (eobp))
+             (insert "\n")
+             (let ((coding-system-for-write 'emacs-internal))
+               (process-send-string proc (buffer-string))
+               ;; (process-send-region proc (point-min) (point-max))
+               )))
+        (read-answer <- (futur-elisp--answer-futur proc)))
+     ;; (trace-values :read-answer read-answer)
+     (pcase read-answer
+       (`(:read-success ,(pred (equal rid)))
+        (futur-let* ((call-answer  <- (futur-elisp--answer-futur proc)))
+          (process-put proc 'futur--ready t)
+          ;; (trace-values :call-answer call-answer)
+          (pcase-exhaustive call-answer
+            (`(:funcall-success ,(pred (equal rid)) . ,val)
+             val)
+            (`(:funcall-error ,(pred (equal rid)) . ,err)
+             (when (stringp (car err)) ;The error is preceded by a backtrace.
+               ;; (message "[Futur] Received error with backtrace: %S\n%s"
+               ;;          (cdr err) (car err))
+               (setq err (nconc (cdr err) (list (car err)))))
+             (futur--resignal err))
+            (`(:unreadable-answer . ,err-data)
+             ;; FIXME: Maybe we should report the whole unreadable string?
+             ;; FIXME: A "common" case is when an error includes un`read'able
+             ;; data, like a buffer, in which case we could convert
+             ;; the error to a `read'able one in `futur-server.el'?
+             (signal 'futur-unreadable-answer err-data)))))
+       (`(:read-success . ,_)
+        ;; (futur--funcall #'futur--client-resync proc)
+        (error "[Futur] Out-of-order reply: %S" read-answer))
+       (_
+        ;; (futur--funcall #'futur--client-resync proc)
+        (error "[Futur] error: %S" read-answer))))))
 
 (defun futur-elisp--funcall (func &rest args)
   "Call FUNC with arguments ARGS like `funcall' but in a subprocess.
@@ -391,9 +402,9 @@ Because it runs in a subprocess, FUNC cannot interact with the user,
 nor can it access the main process' buffers.
 There is no guarantee about the state of the Emacs subprocess in which FUNC
 is called."
-  (futur-elisp--funcall-1
-   (futur-elisp--get-process 'futur-server #'futur-elisp--launch)
-   func args))
+  (futur-elisp--get-process 'futur-server #'futur-elisp--launch
+                            (lambda (proc)
+                              (futur-elisp--funcall-1 proc func args))))
 
 ;;;; Running in a sandbox
 
@@ -459,9 +470,9 @@ This makes it safe to use even when FUNC or ARGS are untrustworthy.
 But DO NOT TRUST the returned result: even if FUNC and ARGS happen to
 be well-behaved, they could be compromised by previous calls
 to `futur-elisp-sandbox--funcall'."
-  (futur-elisp--funcall-1
-   (futur-elisp--get-process 'futur-sandbox #'futur-elisp-sandbox--launch)
-   func args))
+  (futur-elisp--get-process 'futur-server #'futur-elisp-sandbox--launch
+                            (lambda (proc)
+                              (futur-elisp--funcall-1 proc func args))))
 
 (defun futur-elisp--kill-subprocesses ()
   (futur-elisp-sandbox--delete-temp-dir)
