@@ -1,6 +1,7 @@
 Since Version 1.7:
 
 - New function `futur-catch-abort'.
+- New function `futur-dbus-call-method'.
 - Better support for aborting futur-elisp subprocesses.
 
 Version 1.5:

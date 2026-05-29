@@ -150,24 +150,25 @@
 
 ;;;; BUGS
 
-;; - There might still be cases where we run code sometimes in the
-;;   "current" dynamic context and sometimes in the background thread.
+;; - Debugging the asynchronous code is a PITA compounded by bugs and
+;;   limitations of ELisp threads (see for example bug#80286 and bug#80537,
+;;   and if you prefer to set `futur--use-threads' to nil you may
+;;   suffer from bug#80468 instead).
+;;   Also, there is no support for single-stepping with Edebug through
+;;   the code running in an ELisp subprocess.
 ;; - Sometimes the `futur--background' thread gets blocked on some
 ;;   operation (e.g. entering the debugger), which blocks all further
 ;;   execution of async tasks.
 ;; - When launching elisp/sandbox servers (or during `futur-reset-context'),
 ;;   the client receives and displays all the `message's from the subprocess,
-;;   which can be annoying more than helpful.
-;; - When using `futur-hacks-mode' I sometimes see void-variable errors
-;;   about `cl-struct-eieio--class-tags' which sound like problems in
-;;   `futur--obarray-snapshot/revert'.  I have not investigated them yet,
-;;   but maybe this idea of obarray snapshots can't work reliably.
+;;   which can be more annoying than helpful.
 
 ;;; News:
 
 ;; Since Version 1.7:
 
 ;; - New function `futur-catch-abort'.
+;; - New function `futur-dbus-call-method'.
 ;; - Better support for aborting futur-elisp subprocesses.
 
 ;; Version 1.5:
@@ -1369,6 +1370,30 @@ URL-encoded before it's used."
      (with-current-buffer buf (funcall body-fun))
      (lambda () (and (buffer-live-p buf)
                 (kill-buffer buf))))))
+
+;;;; D-BUS futures
+
+(defun futur-dbus-call-method (bus service path interface method &rest args)
+  "Call METHOD on the D-Bus BUS.
+This is like `dbus-call-method' (which see for details
+about the meaning of each argument), except that it returns a `futur'."
+  (require 'dbus)
+  (declare-function dbus-call-method-asynchronously "dbus"
+                    (bus service path interface method handler &rest args))
+  ;; FIXME: IIUC, this won't work reliably when used inside
+  ;; a `futur-blocking-wait-to-get-result' because the D-Bus events get
+  ;; stuck in the input queue and don't get processed if there a real
+  ;; input event in front of them.
+  (futur-new (lambda (fut)
+               (apply #'dbus-call-method-asynchronously
+                      bus service path interface method
+                      (if (< emacs-major-version 32)
+                          ;; Sadly in Emacs<32 we can't get access to errors.
+                          (lambda (&rest args) (futur-deliver-value fut args))
+                        (cons (lambda (&rest args) (futur-deliver-value fut args))
+                              (lambda (err) (futur-deliver-failure fut err))))
+                      args)
+               nil)))
 
 (provide 'futur)
 ;;; futur.el ends here
