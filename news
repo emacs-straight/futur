@@ -1,10 +1,10 @@
-Since Version 1.7:
+Version 2.0:
 
 - New functions `futur-elisp-funcall' and `futur-elisp-sandbox-funcall'
   to run ELisp code concurrently in subprocesses.
+- Better support for aborting futur-elisp subprocesses.
 - New function `futur-catch-abort'.
 - New function `futur-dbus-call-method'.
-- Better support for aborting futur-elisp subprocesses.
 
 Version 1.5:
 
