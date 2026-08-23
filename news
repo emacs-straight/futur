@@ -1,3 +1,7 @@
+Recent:
+
+- Fix issues found when using timers instead of threads.
+
 Version 2.0:
 
 - New functions `futur-elisp-funcall' and `futur-elisp-sandbox-funcall'
