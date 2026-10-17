@@ -1,6 +1,7 @@
-Recent:
+Since 2.0:
 
 - Fix issues found when using timers instead of threads.
+- Tell Flymake that our sandboxed `elisp-flymake-byte-compile' is safe.
 
 Version 2.0:
 
